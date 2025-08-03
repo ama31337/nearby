@@ -7,12 +7,12 @@ tg bot to monitor near validator
 ```sh
 cd $HOME && git clone -v https://github.com/ama31337/nearby.git && cd ./nearby && chmod +x ./installsbot.sh
 ```
- 3. Open ./config.py and insert your bot API, telegram id, pool name and alert settings
- 4. Run script ./installsbot.sh for Ubuntu/Debian, source your bash to make bot start/stop commands working
- 5. Send to your new bot command /start
+ 3. Open env.py and insert your bot API, telegram id, pool name and alert settings
+ 4. Run script ./installsbot.sh
 ```sh
 ./installsbot.sh
 ```
 ```sh
 source ${HOME}/.bashrc
 ```
+ 5. Send to your new bot command /start
