@@ -317,4 +317,24 @@ def handle(msg):
             bot.send_message(cid, run_async(get_pool_info()))
             return
 
-        if text in ["⏩
+        if text in ["⏩ Next", "Next"]:
+            bot.send_message(cid, run_async(get_next_validators()))
+            return
+
+        if text in ["⏩ Proposals", "Proposals"]:
+            bot.send_message(cid, run_async(get_proposals()))
+            return
+
+        if text == "📋 Near logs":
+            logs = subprocess.getoutput("journalctl -u neard.service -n 10 --no-pager")
+            bot.send_message(cid, f"<code>{logs}</code>", parse_mode="HTML")
+            return
+
+        bot.send_message(cid, "Unknown command", reply_markup=markup)
+    except Exception as e:
+        bot.send_message(cid, f"Error: {e}")
+
+
+if __name__ == "__main__":
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
