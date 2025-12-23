@@ -2,17 +2,23 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
-import os
+import subprocess
 import threading
 import time
 import traceback
-import subprocess
 
 import env
 import telebot
 from telebot import types
+
 from py_near.providers import JsonProvider
-from py_near.exceptions.exceptions import RpcEmptyResponse
+
+try:
+    from py_near.exceptions.exceptions import RpcEmptyResponse
+except Exception:
+    class RpcEmptyResponse(Exception):
+        pass
+
 
 BOT_API_KEY = env.BotAPIKey
 NEAR_NETWORK = getattr(env, "NEAR_NETWORK", "mainnet")
@@ -28,17 +34,17 @@ RPC_URLS = list(getattr(env, "RPC_URLS", []))
 if not RPC_URLS:
     RPC_URLS = [f"https://rpc.{NEAR_NETWORK}.near.org"]
 
+CHECK_INTERVAL_SECONDS = int(getattr(env, "CHECK_INTERVAL_SECONDS", 30))
+
+
 bot = telebot.TeleBot(BOT_API_KEY)
 
 markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
 markup.row("ℹ My pool info", "⏩ Proposals", "⏩ Next")
 markup.row("📋 Near logs")
 
-loop = asyncio.new_event_loop()
 
-_provider_lock = asyncio.Lock()
-_provider = None
-_rpc_index = 0
+loop = asyncio.new_event_loop()
 
 
 def loop_runner():
@@ -52,6 +58,11 @@ threading.Thread(target=loop_runner, daemon=True).start()
 def run_async(coro, timeout=45):
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
     return fut.result(timeout=timeout)
+
+
+_provider_lock = asyncio.Lock()
+_provider = None
+_rpc_index = 0
 
 
 async def _get_provider():
@@ -86,7 +97,17 @@ async def with_retries(coro_factory, attempts=6, base_sleep=1.0):
             sleep_s = 20
         await asyncio.sleep(sleep_s)
 
-    raise last_exc if last_exc else RuntimeError("Unknown RPC error")
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("RPC error, unknown")
+
+
+async def get_validators_data():
+    async def do_call():
+        provider = await _get_provider()
+        return await provider.get_validators()
+
+    return await with_retries(do_call)
 
 
 def format_pool_info(val, stake, rank_index, total_validators):
@@ -109,19 +130,11 @@ def format_pool_info(val, stake, rank_index, total_validators):
     line = f"ℹ Pool Info: {val.get('account_id', VALIDATOR_ACCOUNT)}"
     stake_line = f"{'Stake:':15} {stake:.1f} Ⓝ"
     rank_line = f"{'Rank by stake:':15} {rank_index}/{total_validators}"
-    blk_line = f"{'Blocks:':15} {blk_prod}/{blk_exp} - {blk_pct:.1f}% {blk_emoji}"
-    chk_line = f"{'Chunks:':15} {chk_prod}/{chk_exp} - {chk_pct:.1f}% {chk_emoji}"
-    end_line = f"{'Endorsements:':15} {end_prod}/{end_exp} - {end_pct:.1f}% {end_emoji}"
+    blk_line = f"{'Blocks:':15} {blk_prod}/{blk_exp} , {blk_pct:.1f}% {blk_emoji}"
+    chk_line = f"{'Chunks:':15} {chk_prod}/{chk_exp} , {chk_pct:.1f}% {chk_emoji}"
+    end_line = f"{'Endorsements:':15} {end_prod}/{end_exp} , {end_pct:.1f}% {end_emoji}"
 
     return "\n".join([line, stake_line, rank_line, blk_line, chk_line, end_line])
-
-
-async def get_validators_data():
-    async def do_call():
-        provider = await _get_provider()
-        return await provider.get_validators()
-
-    return await with_retries(do_call)
 
 
 async def get_pool_info():
@@ -157,7 +170,7 @@ async def get_next_validators():
 
     v = match[0]
     stake = int(v.get("stake", 0)) / 1e24
-    return f"⏩ Next Validators\n✅ {v.get('account_id')} | {stake:.1f} Ⓝ"
+    return f"⏩ Next Validators\n✅ {v.get('account_id')} , {stake:.1f} Ⓝ"
 
 
 async def get_proposals():
@@ -169,12 +182,58 @@ async def get_proposals():
 
     v = match[0]
     stake = int(v.get("stake", 0)) / 1e24
-    return f"📬 Proposals\n✅ {v.get('account_id')} | {stake:.1f} Ⓝ"
+    return f"📬 Proposals\n✅ {v.get('account_id')} , {stake:.1f} Ⓝ"
+
+
+ALERT_BACKOFF = [0, 60, 300]
+ALERT_STATE = {
+    "blocks": {"last": 0, "stage": 0, "next_ts": 0.0},
+    "chunks": {"last": 0, "stage": 0, "next_ts": 0.0},
+    "endorsements": {"last": 0, "stage": 0, "next_ts": 0.0},
+}
+
+
+def reset_metric_state(metric):
+    st = ALERT_STATE[metric]
+    st["last"] = 0
+    st["stage"] = 0
+    st["next_ts"] = 0.0
+
+
+def sync_state_for_value(metric, value, now_ts):
+    st = ALERT_STATE[metric]
+
+    if value <= 0:
+        reset_metric_state(metric)
+        return False
+
+    if value != st["last"]:
+        st["last"] = value
+        st["stage"] = 0
+        st["next_ts"] = now_ts
+
+    if st["stage"] >= len(ALERT_BACKOFF):
+        return False
+
+    return now_ts >= st["next_ts"]
+
+
+def mark_sent(metric, now_ts):
+    st = ALERT_STATE[metric]
+    st["stage"] += 1
+
+    if st["stage"] >= len(ALERT_BACKOFF):
+        st["next_ts"] = 0.0
+        return
+
+    st["next_ts"] = now_ts + float(ALERT_BACKOFF[st["stage"]])
 
 
 async def check_alerts():
     if ADMIN_CHAT_ID is None:
         return
+
+    now_ts = time.time()
 
     data = await get_validators_data()
     current_validators = data.get("current_validators", [])
@@ -182,29 +241,56 @@ async def check_alerts():
     if not val:
         return
 
-    alerts = []
-
     blk_prod = int(val.get("num_produced_blocks", 0))
-    blk_exp = int(val.get("num_expected_blocks", 1))
+    blk_exp = int(val.get("num_expected_blocks", 0))
     blk_missed = max(0, blk_exp - blk_prod)
-    if blk_missed >= MAX_MISSED_BLOCKS:
-        alerts.append(f"📛 Missed blocks: {blk_missed} of {blk_exp}")
 
     chk_prod = int(val.get("num_produced_chunks", 0))
-    chk_exp = int(val.get("num_expected_chunks", 1))
+    chk_exp = int(val.get("num_expected_chunks", 0))
     chk_missed = max(0, chk_exp - chk_prod)
-    if chk_missed >= MAX_MISSED_CHUNKS:
-        alerts.append(f"📛 Missed chunks: {chk_missed} of {chk_exp}")
 
     end_prod = int(val.get("num_produced_endorsements", 0))
-    end_exp = int(val.get("num_expected_endorsements", 1))
+    end_exp = int(val.get("num_expected_endorsements", 0))
     end_missed = max(0, end_exp - end_prod)
-    if end_missed >= MAX_MISSED_ENDORSEMENTS:
-        alerts.append(f"📛 Missed endorsements: {end_missed} of {end_exp}")
 
-    if alerts:
-        msg = f"🚨 ALERT for {VALIDATOR_ACCOUNT}\n" + "\n".join(alerts)
-        bot.send_message(ADMIN_CHAT_ID, msg)
+    send_blocks = False
+    send_chunks = False
+    send_ends = False
+
+    if blk_missed >= MAX_MISSED_BLOCKS:
+        send_blocks = sync_state_for_value("blocks", blk_missed, now_ts)
+    else:
+        reset_metric_state("blocks")
+
+    if chk_missed >= MAX_MISSED_CHUNKS:
+        send_chunks = sync_state_for_value("chunks", chk_missed, now_ts)
+    else:
+        reset_metric_state("chunks")
+
+    if end_missed >= MAX_MISSED_ENDORSEMENTS:
+        send_ends = sync_state_for_value("endorsements", end_missed, now_ts)
+    else:
+        reset_metric_state("endorsements")
+
+    if not (send_blocks or send_chunks or send_ends):
+        return
+
+    lines = [f"🚨 ALERT for {VALIDATOR_ACCOUNT}"]
+    if send_blocks:
+        lines.append(f"📛 Missed blocks: {blk_missed} of {blk_exp}")
+    if send_chunks:
+        lines.append(f"📛 Missed chunks: {chk_missed} of {chk_exp}")
+    if send_ends:
+        lines.append(f"📛 Missed endorsements: {end_missed} of {end_exp}")
+
+    bot.send_message(ADMIN_CHAT_ID, "\n".join(lines))
+
+    if send_blocks:
+        mark_sent("blocks", now_ts)
+    if send_chunks:
+        mark_sent("chunks", now_ts)
+    if send_ends:
+        mark_sent("endorsements", now_ts)
 
 
 def monitor_loop():
@@ -213,7 +299,7 @@ def monitor_loop():
             run_async(check_alerts(), timeout=60)
         except Exception:
             traceback.print_exc()
-        time.sleep(30)
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 
 @bot.message_handler(commands=["start"])
@@ -231,25 +317,4 @@ def handle(msg):
             bot.send_message(cid, run_async(get_pool_info()))
             return
 
-        if text in ["⏩ Next", "Next"]:
-            bot.send_message(cid, run_async(get_next_validators()))
-            return
-
-        if text in ["⏩ Proposals", "Proposals"]:
-            bot.send_message(cid, run_async(get_proposals()))
-            return
-
-        if text == "📋 Near logs":
-            logs = subprocess.getoutput("journalctl -u neard.service -n 10 --no-pager")
-            bot.send_message(cid, f"<code>{logs}</code>", parse_mode="HTML")
-            return
-
-        bot.send_message(cid, "Unknown command", reply_markup=markup)
-    except Exception as e:
-        bot.send_message(cid, f"Error: {e}")
-
-
-if __name__ == "__main__":
-    t = threading.Thread(target=monitor_loop, daemon=True)
-    t.start()
-    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+        if text in ["⏩
