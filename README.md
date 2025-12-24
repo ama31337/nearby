@@ -7,7 +7,7 @@ tg bot to monitor near validator
 ```sh
 cd $HOME && git clone -v https://github.com/ama31337/nearby.git && cd ./nearby && chmod +x ./installsbot.sh
 ```
- 3. Open env.py and insert your bot API, telegram id, pool name and alert settings
+ 3. Copy env.py.example to env.py and insert your bot API, telegram id, pool name and alert settings
  4. Run script ./installsbot.sh
 ```sh
 ./installsbot.sh
