@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -62,6 +61,11 @@ RPC_FAILURE_ALERTED = False
 # Shutdown flag
 _shutdown_event = threading.Event()
 
+# Status tracking
+_bot_start_time: float = time.time()
+_last_check_time: float = 0.0
+_last_check_success: bool = False
+
 # Configure logging
 LOG_FILE = getattr(env, "LOG_FILE", "nearby.log")
 logger.remove()  # Remove default handler
@@ -80,7 +84,7 @@ def is_authorized(user_id: int) -> bool:
 
 markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
 markup.row("ℹ My pool info", "⏩ Proposals", "⏩ Next")
-markup.row("📋 Near logs")
+markup.row("📊 Status")
 
 
 loop = asyncio.new_event_loop()
@@ -344,12 +348,22 @@ def mark_sent(metric: str, now_ts: float) -> None:
 
 async def check_alerts() -> None:
     """Check validator metrics and send alerts if performance drops below thresholds."""
+    global _last_check_time, _last_check_success
+
+    now_ts = time.time()
+    _last_check_time = now_ts
+
+    try:
+        data = await get_validators_data()
+    except Exception:
+        _last_check_success = False
+        raise
+
+    _last_check_success = True
+
     if ADMIN_CHAT_ID is None:
         return
 
-    now_ts = time.time()
-
-    data = await get_validators_data()
     val = find_validator(data.get("current_validators", []), VALIDATOR_ACCOUNT)
     if not val:
         return
@@ -432,6 +446,69 @@ def start(msg):
     bot.send_message(msg.chat.id, "Select option:", reply_markup=markup)
 
 
+@bot.message_handler(commands=["help"])
+def help_command(msg):
+    if not is_authorized(msg.from_user.id):
+        bot.send_message(msg.chat.id, "⛔ Access denied. Contact administrator.")
+        return
+
+    help_text = f"""📖 <b>NEAR Validator Bot</b>
+
+<b>Commands:</b>
+/start — Show main menu
+/help — Show this help
+/status — Bot status and last check info
+
+<b>Menu buttons:</b>
+ℹ My pool info — Validator stake, rank, and metrics
+⏩ Proposals — Check if in proposals
+⏩ Next — Check if in next validators
+📊 Status — Bot uptime and RPC status
+
+<b>Monitoring:</b>
+Pool: <code>{VALIDATOR_ACCOUNT}</code>
+Network: <code>{NEAR_NETWORK}</code>
+Alert thresholds: blocks &lt;{MIN_BLOCK_PERCENT}%, chunks &lt;{MIN_CHUNK_PERCENT}%, endorsements &lt;{MIN_ENDORSEMENT_PERCENT}%"""
+
+    bot.send_message(msg.chat.id, help_text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["status"])
+def status_command(msg):
+    if not is_authorized(msg.from_user.id):
+        bot.send_message(msg.chat.id, "⛔ Access denied. Contact administrator.")
+        return
+
+    now = time.time()
+    uptime_seconds = int(now - _bot_start_time)
+    uptime_hours = uptime_seconds // 3600
+    uptime_minutes = (uptime_seconds % 3600) // 60
+
+    if _last_check_time > 0:
+        last_check_ago = int(now - _last_check_time)
+        last_check_str = f"{last_check_ago}s ago"
+    else:
+        last_check_str = "never"
+
+    check_status = "✅ OK" if _last_check_success else "❌ Failed"
+    rpc_status = "✅ OK" if RPC_CONSECUTIVE_FAILURES == 0 else f"⚠️ {RPC_CONSECUTIVE_FAILURES} failures"
+
+    status_text = f"""📊 <b>Bot Status</b>
+
+<b>Uptime:</b> {uptime_hours}h {uptime_minutes}m
+<b>Last check:</b> {last_check_str} — {check_status}
+<b>RPC status:</b> {rpc_status}
+<b>Check interval:</b> {CHECK_INTERVAL_SECONDS}s
+
+<b>Config:</b>
+Pool: <code>{VALIDATOR_ACCOUNT}</code>
+Network: <code>{NEAR_NETWORK}</code>
+RPC endpoints: {len(RPC_URLS)}
+Admin alerts: {"✅ enabled" if ADMIN_CHAT_ID else "❌ disabled"}"""
+
+    bot.send_message(msg.chat.id, status_text, parse_mode="HTML")
+
+
 @bot.message_handler(func=lambda m: True)
 def handle(msg):
     if not is_authorized(msg.from_user.id):
@@ -456,20 +533,8 @@ def handle(msg):
             bot.send_message(cid, run_async(get_proposals()))
             return
 
-        if text == "📋 Near logs":
-            try:
-                result = subprocess.run(
-                    ["journalctl", "-u", "neard.service", "-n", "10", "--no-pager"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                logs = result.stdout or result.stderr or "No logs available"
-            except subprocess.TimeoutExpired:
-                logs = "Timeout while fetching logs"
-            except FileNotFoundError:
-                logs = "journalctl not found"
-            bot.send_message(cid, f"<code>{logs}</code>", parse_mode="HTML")
+        if text in ["📊 Status", "Status"]:
+            status_command(msg)
             return
 
         bot.send_message(cid, "Unknown command", reply_markup=markup)
