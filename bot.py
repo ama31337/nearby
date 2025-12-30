@@ -43,9 +43,10 @@ VALIDATOR_ACCOUNT = env.POOL_NAME
 ADMIN_CHAT_ID = getattr(env, "AdminChatID", None)
 ALLOWED_USERS = list(getattr(env, "ALLOWED_USERS", []))
 
-MAX_MISSED_BLOCKS = int(getattr(env, "MAX_MISSED_BLOCKS", 999999))
-MAX_MISSED_CHUNKS = int(getattr(env, "MAX_MISSED_CHUNKS", 999999))
-MAX_MISSED_ENDORSEMENTS = int(getattr(env, "MAX_MISSED_ENDORSEMENTS", 999999))
+# Alert thresholds: alert when performance drops below these percentages
+MIN_BLOCK_PERCENT = float(getattr(env, "MIN_BLOCK_PERCENT", 90))
+MIN_CHUNK_PERCENT = float(getattr(env, "MIN_CHUNK_PERCENT", 90))
+MIN_ENDORSEMENT_PERCENT = float(getattr(env, "MIN_ENDORSEMENT_PERCENT", 90))
 
 RPC_URLS = list(getattr(env, "RPC_URLS", []))
 if not RPC_URLS:
@@ -342,7 +343,7 @@ def mark_sent(metric: str, now_ts: float) -> None:
 
 
 async def check_alerts() -> None:
-    """Check validator metrics and send alerts if thresholds exceeded."""
+    """Check validator metrics and send alerts if performance drops below thresholds."""
     if ADMIN_CHAT_ID is None:
         return
 
@@ -353,34 +354,37 @@ async def check_alerts() -> None:
     if not val:
         return
 
+    # Calculate percentages
     blk_prod = int(val.get("num_produced_blocks", 0))
     blk_exp = int(val.get("num_expected_blocks", 0))
-    blk_missed = max(0, blk_exp - blk_prod)
+    blk_pct = calculate_percentage(blk_prod, blk_exp) if blk_exp > 0 else 100.0
 
     chk_prod = int(val.get("num_produced_chunks", 0))
     chk_exp = int(val.get("num_expected_chunks", 0))
-    chk_missed = max(0, chk_exp - chk_prod)
+    chk_pct = calculate_percentage(chk_prod, chk_exp) if chk_exp > 0 else 100.0
 
     end_prod = int(val.get("num_produced_endorsements", 0))
     end_exp = int(val.get("num_expected_endorsements", 0))
-    end_missed = max(0, end_exp - end_prod)
+    end_pct = calculate_percentage(end_prod, end_exp) if end_exp > 0 else 100.0
 
     send_blocks = False
     send_chunks = False
     send_ends = False
 
-    if blk_missed >= MAX_MISSED_BLOCKS:
-        send_blocks = sync_state_for_value("blocks", blk_missed, now_ts)
+    # Alert when percentage drops below threshold
+    # Use inverted percentage (100 - pct) for state tracking so higher = worse
+    if blk_pct < MIN_BLOCK_PERCENT:
+        send_blocks = sync_state_for_value("blocks", int(100 - blk_pct), now_ts)
     else:
         reset_metric_state("blocks")
 
-    if chk_missed >= MAX_MISSED_CHUNKS:
-        send_chunks = sync_state_for_value("chunks", chk_missed, now_ts)
+    if chk_pct < MIN_CHUNK_PERCENT:
+        send_chunks = sync_state_for_value("chunks", int(100 - chk_pct), now_ts)
     else:
         reset_metric_state("chunks")
 
-    if end_missed >= MAX_MISSED_ENDORSEMENTS:
-        send_ends = sync_state_for_value("endorsements", end_missed, now_ts)
+    if end_pct < MIN_ENDORSEMENT_PERCENT:
+        send_ends = sync_state_for_value("endorsements", int(100 - end_pct), now_ts)
     else:
         reset_metric_state("endorsements")
 
@@ -389,11 +393,11 @@ async def check_alerts() -> None:
 
     lines = [f"🚨 ALERT for {VALIDATOR_ACCOUNT}"]
     if send_blocks:
-        lines.append(f"📛 Missed blocks: {blk_missed} of {blk_exp}")
+        lines.append(f"📛 Blocks: {blk_pct:.1f}% ({blk_prod}/{blk_exp}) — below {MIN_BLOCK_PERCENT}%")
     if send_chunks:
-        lines.append(f"📛 Missed chunks: {chk_missed} of {chk_exp}")
+        lines.append(f"📛 Chunks: {chk_pct:.1f}% ({chk_prod}/{chk_exp}) — below {MIN_CHUNK_PERCENT}%")
     if send_ends:
-        lines.append(f"📛 Missed endorsements: {end_missed} of {end_exp}")
+        lines.append(f"📛 Endorsements: {end_pct:.1f}% ({end_prod}/{end_exp}) — below {MIN_ENDORSEMENT_PERCENT}%")
 
     bot.send_message(ADMIN_CHAT_ID, "\n".join(lines))
 
