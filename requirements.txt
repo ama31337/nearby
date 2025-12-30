@@ -1,3 +1,4 @@
+loguru==0.7.2
 psutil==5.9.8
 py_near==1.1.57
 pyTelegramBotAPI==4.28.0
